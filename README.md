@@ -1,50 +1,69 @@
 # Exercise 2: Data Pipeline with NoSQL Data Source
-## 1. Project Overview & Context
-The project aim to automate the ingestion and normalization of heterogeneous Togolese Public Service Requests (citizen reports, administrative requests, complaints, etc.) from a NoSQL source (MongoDB) into an analytics-ready format.
+## Project overview
+This repository implements a containerized data pipeline that ingests heterogeneous NoSQL records (source JSON / MongoDB), applies schema normalization and validation, and produces analytics-ready datasets in a layered (Bronze / Silver / Gold) architecture.
 
-## 2. Architecture & Tech Stack
-- **Ingestion**: I will use Python (PyMongo) for seeding the MongoDB with provided json file. And will use Spark (PySpark) for its flexibility with missing fields.
-- **Orchestration**: I will use Apache Airflow to manage the workflow, retries, and task dependencies. With Airflow we can design the workflow across tasks
-- **Processing**: I will use Apache Spark to handle distributed transformations and schema evolution at scale.
-- **Data Quality**: Great Expectations – To ensure "Silver" data adheres to business rules before reaching stakeholders.
-- **Storage**: Medallion Architecture (Bronze/Silver/Gold) stored in Parquet.
+## Architecture overview and why these choices
 
-## 3. Data Pipeline Logic
-1. **Stage 1: Bronze (Raw)**
-    - I will use the data from MongoDB collection and do extraction and storage as Parquet.
-    - I assume we treat the NoSQL source as "The Truth," capturing all nested fields and inconsistent keys.
-    - Data is stored in Parquet format. This allows for schema evolution support and provides significant compression.
+- **Containerized Spark (Docker Compose)**: Reproducible local cluster — Docker Compose lets us run a small Spark master/worker environment that mirrors production clusters. This simplifies development, testing, and CI while keeping deployments consistent.
 
-2. **Stage 2: Silver (Cleaned & Normalized)**
-    - Schema Evolution: Explain how you handle new fields. If a document arrives with a new commune field that didn't exist yesterday, Spark's schema inference will adapt or store it in a catch-all metadata column.
+- **Apache Spark (PySpark)**: Chosen for scalable ETL and robust handling of semi-structured data. Spark provides:
+    - native support for evolving schemas and nested data structures,
+    - efficient distributed processing for larger datasets,
+    - easy integration with Parquet and S3-compatible stores.
 
-    - Normalization:
-        - Dates: Standardizing DD/MM/YYYY, ISO8601, and Timestamp into a single UTC format.
-        - Geospatial: Extracting lat/long from various formats (nested vs. string).
-        - Deduplication: Removing duplicate request_id entries.
+- **MinIO / S3-compatible object store (local dev)**: S3 API compatibility gives production parity while remaining self-contained for local development. Object storage + Parquet is ideal for columnar I/O and incremental processing.
 
-3. **Stage 3: Gold (Analytical)**
-    - Action: Aggregations for the Togolese administration.
-    - Example KPIs:
-        - Report Volume by Region: (Maritime, Plateaux, Centrale, Kara, Savanes).
-        - Service Efficiency: Average resolution time for "Civil Status" vs "Education" requests.
+- **Medallion (Bronze / Silver / Gold) layering**: This pattern separates concerns:
+    - Bronze: raw ingested data (exact snapshot of source) — traceability and replayability.
+    - Silver: cleaned, normalized, and validated rows (business schema applied).
+    - Gold: aggregated, analytics-ready tables or views for reporting/BI.
 
-## 4. Data Quality & Robustness
-Explain how you manage "Imperfect Data":
-- Validation Rules: "Every record must have a valid service_type."
-- Alerting: Logic for handling records that fail validation (The "Dead Letter Queue" concept).
+- **Parquet for persisted data**: Columnar format provides compression, predicate pushdown, and efficient analytics; it naturally complements Spark and S3-like storage.
 
-## 5. Deployment & Execution
-- **Prerequisites**: 
-    - Docker
-    - Docker Compose
-- **Setup**:
+- **Config-driven mapping (config/mapping_catalog.json)**: Keeps transformation rules and field mappings external to code so schema changes are handled by config updates rather than brittle code edits.
+
+- **Separation of concerns (src/)**:
+    - `src/ingestion.py` — fetches raw data and persists Bronze.
+    - `src/transformation.py` — normalization and Silver logic.
+    - `src/reporting.py` — Gold-level aggregations and writes to final targets.
+Keeping these responsibilities separated improves testability and maintenance.
+
+## How these choices map to the repo
+
+- Source files: `src/ingestion.py`, `src/transformation.py`, `src/reporting.py`
+- Configuration: `config/mapping_catalog.json`
+- Local object-store helper: `scripts/upload_to_minio.py`
+- Infrastructure: `docker-compose.yml`, `Dockerfile`, `requirements.txt`
+
+## Practical reasons / trade-offs
+
+- Scalability vs Complexity: Spark adds operational complexity but is justified if data volume or transformation complexity grows; for very small datasets, a lightweight runner (Pandas) could be used for prototyping.
+
+- Local development parity: Docker + MinIO approximates production S3 and cluster behavior without external dependencies.
+
+- Observability & data quality: Medallion layering plus explicit validation (e.g., Great Expectations if integrated later) keeps errors isolated and auditable.
+
+## Quick start (development)
+
+Start the stack:
 ```bash
-    docker-compose up -d
-    docker exec -it python scripts/seed_mongo.py
+docker-compose up -d
 ```
-- Trigger the Airflow DAG by accessing the Airflow UI at http://localhost:8090
 
-## 6. Future Improvements
-- CI/CD: Automating unit tests for Spark transformations.
-- Monitoring: Integrating Prometheus/Grafana to track pipeline latency.
+Example: run the reporting job inside the Spark master (matches how it's executed in this project):
+```bash
+docker exec -it spark-master spark-submit --master spark://spark-master:7077 /app/src/reporting.py
+```
+
+Local script tests (non-cluster):
+```bash
+python3 src/ingestion.py    # run ingestion locally (reads config/data and writes Bronze)
+python3 src/transformation.py
+python3 src/reporting.py
+```
+
+## Next steps and recommendations
+
+- Add a lightweight orchestration (Airflow / Prefect) for production DAGs and retries.
+- Add basic metrics/monitoring (pipeline durations, error counts).
+
