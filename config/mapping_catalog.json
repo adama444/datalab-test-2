@@ -1,0 +1,53 @@
+{
+    "mappings": {
+        "standard_id": [
+            "event.id",
+            "request_id",
+            "id",
+            "_id",
+            "ref"
+        ],
+        "standard_service": [
+            "event.payload.type",
+            "type",
+            "category",
+            "type_demande",
+            "service_type",
+            "service"
+        ],
+        "standard_status": [
+            "status",
+            "state",
+            "statut"
+        ],
+        "standard_commune": [
+            "event.payload.commune",
+            "city",
+            "localisation.commune",
+            "location.commune"
+        ],
+        "standard_neighborhood": [
+            "event.payload.quartier",
+            "district",
+            "localisation.quartier",
+            "district_name"
+        ]
+    },
+    "date_config": {
+        "source_fields": [
+            "event.timestamp",
+            "date",
+            "created_at",
+            "date_creation",
+            "date_signalement",
+            "created"
+        ],
+        "formats": [
+            "yyyy-MM-dd",
+            "dd/MM/yyyy",
+            "yyyy/MM/dd",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSSSS",
+            "yyyy-MM-dd'T'HH:mm:ss"
+        ]
+    }
+}
