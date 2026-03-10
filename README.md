@@ -1,69 +1,43 @@
 # Exercise 2: Data Pipeline with NoSQL Data Source
 ## Project overview
-This repository implements a containerized data pipeline that ingests heterogeneous NoSQL records (source JSON / MongoDB), applies schema normalization and validation, and produces analytics-ready datasets in a layered (Bronze / Silver / Gold) architecture.
+This repository implements an end-to-end data pipeline designed to centralize and normalize public service reports (waste management, street lighting, road maintenance) in Togo. It transforms heterogeneous NoSQL records into validated, analytics-ready datasets for urban decision-making.
 
-## Architecture overview and why these choices
+## Architecture overview and technical choices
+### 1. Medallion Layering (Bronze / Silver / Gold)
+- **Bronze (Raw)**: Ingests raw JSON records into MinIO. This ensures full data traceability and the ability to replay the pipeline from source.
+- **Silver (Cleaned)**: Applies dynamic normalization via PySpark. Data is cleaned (date formats standardized, field mapping applied) and stored in Parquet format for optimized query performance.
+- **Gold (Analytics)**: Exports the refined data to PostgreSQL + PostGIS. Data is structured within a schema and ready for immediate consumption by Apache Superset.
 
-- **Containerized Spark (Docker Compose)**: Reproducible local cluster — Docker Compose lets us run a small Spark master/worker environment that mirrors production clusters. This simplifies development, testing, and CI while keeping deployments consistent.
+### 2. Technology Stack
+- **Containerization (Docker Compose)**: Reproducible local cluster — Docker Compose lets us run a small Spark master/worker environment that mirrors production clusters. This simplifies development, testing, and CI while keeping deployments consistent.
 
-- **Apache Spark (PySpark)**: Chosen for scalable ETL and robust handling of semi-structured data. Spark provides:
+- **Orchestration**: Apache Airflow. Automates the task sequence: Ingestion → Transformation → Gold Loading.
+- **Processing Engine**: Apache Spark (PySpark). Selected for its ability to handle evolving schemas and distributed processing. Spark provides:
     - native support for evolving schemas and nested data structures,
     - efficient distributed processing for larger datasets,
     - easy integration with Parquet and S3-compatible stores.
 
-- **MinIO / S3-compatible object store (local dev)**: S3 API compatibility gives production parity while remaining self-contained for local development. Object storage + Parquet is ideal for columnar I/O and incremental processing.
-
-- **Medallion (Bronze / Silver / Gold) layering**: This pattern separates concerns:
-    - Bronze: raw ingested data (exact snapshot of source) — traceability and replayability.
-    - Silver: cleaned, normalized, and validated rows (business schema applied).
-    - Gold: aggregated, analytics-ready tables or views for reporting/BI.
+- **Object Storage**: MinIO. Provides an S3-compatible API for local development with production parity.
+- **Database**: PostgreSQL with PostGIS extension. Manages geographical coordinates for service requests across Togolese communes (e.g., Lomé, Aného).
+- **BI & Visualization**: Apache Superset. Powers interactive dashboards for operational monitoring.
 
 - **Parquet for persisted data**: Columnar format provides compression, predicate pushdown, and efficient analytics; it naturally complements Spark and S3-like storage.
 
-- **Config-driven mapping (config/mapping_catalog.json)**: Keeps transformation rules and field mappings external to code so schema changes are handled by config updates rather than brittle code edits.
-
-- **Separation of concerns (src/)**:
-    - `src/ingestion.py` — fetches raw data and persists Bronze.
-    - `src/transformation.py` — normalization and Silver logic.
-    - `src/reporting.py` — Gold-level aggregations and writes to final targets.
-Keeping these responsibilities separated improves testability and maintenance.
-
-## How these choices map to the repo
-
-- Source files: `src/ingestion.py`, `src/transformation.py`, `src/reporting.py`
-- Configuration: `config/mapping_catalog.json`
-- Local object-store helper: `scripts/upload_to_minio.py`
-- Infrastructure: `docker-compose.yml`, `Dockerfile`, `requirements.txt`
+### 3. Config-Driven Mapping
+The pipeline uses a mapping_catalog.json file to externalize transformation rules. This allows for field updates (e.g., adding a new source field for a district) without modifying the Python source code, making the system resilient to NoSQL schema drift.It Keeps transformation rules and field mappings external to code so schema changes are handled by config updates rather than brittle code edits.
 
 ## Practical reasons / trade-offs
-
 - Scalability vs Complexity: Spark adds operational complexity but is justified if data volume or transformation complexity grows; for very small datasets, a lightweight runner (Pandas) could be used for prototyping.
-
 - Local development parity: Docker + MinIO approximates production S3 and cluster behavior without external dependencies.
+- Observability & data quality: Medallion layering plus explicit validation keeps errors isolated and auditable.
 
-- Observability & data quality: Medallion layering plus explicit validation (e.g., Great Expectations if integrated later) keeps errors isolated and auditable.
-
-## Quick start (development)
-
+## Getting started
 Start the stack:
 ```bash
 docker-compose up -d
 ```
 
-Example: run the reporting job inside the Spark master (matches how it's executed in this project):
-```bash
-docker exec -it spark-master spark-submit --master spark://spark-master:7077 /app/src/reporting.py
-```
-
-Local script tests (non-cluster):
-```bash
-python3 src/ingestion.py    # run ingestion locally (reads config/data and writes Bronze)
-python3 src/transformation.py
-python3 src/reporting.py
-```
-
 ## Next steps and recommendations
-
-- Add a lightweight orchestration (Airflow / Prefect) for production DAGs and retries.
 - Add basic metrics/monitoring (pipeline durations, error counts).
+- Handle a duplicated values following some business rules
 
