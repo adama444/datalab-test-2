@@ -22,6 +22,8 @@ x-airflow-common: &airflow-common
     POSTGRES_DB: ${POSTGRES_DB}
     POSTGRES_USER: ${POSTGRES_USER}
     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    SILVER_SCHEMA: ${SILVER_SCHEMA}
+    SILVER_TABLE: ${SILVER_TABLE}
   volumes:
     - ./dags:/opt/airflow/dags
     - ./scripts:/opt/airflow/scripts

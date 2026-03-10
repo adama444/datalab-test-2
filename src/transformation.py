@@ -7,6 +7,7 @@ from pyspark.sql.functions import (
     col,
     coalesce,
     lower,
+    regexp_replace,
     try_to_timestamp,
     from_unixtime,
     lit,
@@ -23,7 +24,6 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Récupère le dossier où se trouve le script actuel
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CATALOG_PATH = os.path.join(SCRIPT_DIR, "mapping_catalog.json")
 
@@ -33,7 +33,7 @@ def get_spark_session():
         SparkSession.builder.appName("Togo-Public-Services-Silver")
         .config("spark.sql.legacy.timeParserPolicy", "CORRECTED")
         .getOrCreate()
-    )  # récupère le contexte déjà configuré par spark-submit
+    )
 
 
 def resolve_column(df, field):
@@ -46,6 +46,56 @@ def resolve_column(df, field):
                 return col(field)
         return None  # parent est string ou absent → on ignore
     return col(field) if field in df.columns else None
+
+
+def apply_geo_parsing(df, geo_cfg):
+    geo_col = None
+    for field in geo_cfg["source_fields"]:
+        c = resolve_column(df, field)
+        if c is not None:
+            geo_col = c
+            logging.info(f"Champ géographique détecté : '{field}'")
+            break
+
+    if geo_col is None:
+        logging.warning(
+            "Aucun champ géographique trouvé. latitude/longitude seront NULL."
+        )
+        df = df.withColumn("latitude", lit(None).cast("double"))
+        df = df.withColumn("longitude", lit(None).cast("double"))
+        return df
+
+    geo_clean = trim(regexp_replace(geo_col.cast("string"), r"\s*,\s*", ","))
+
+    df = df.withColumn(
+        "latitude",
+        when(
+            geo_clean.contains(","),
+            split(geo_clean, ",").getItem(0).cast("double"),
+        ).otherwise(lit(None).cast("double")),
+    )
+    df = df.withColumn(
+        "longitude",
+        when(
+            geo_clean.contains(","),
+            split(geo_clean, ",").getItem(1).cast("double"),
+        ).otherwise(lit(None).cast("double")),
+    )
+
+    df = df.withColumn(
+        "latitude",
+        when(col("latitude").between(-90, 90), col("latitude")).otherwise(
+            lit(None).cast("double")
+        ),
+    )
+    df = df.withColumn(
+        "longitude",
+        when(col("longitude").between(-180, 180), col("longitude")).otherwise(
+            lit(None).cast("double")
+        ),
+    )
+
+    return df
 
 
 def run_silver_pipeline(filename="demandes_togo_raw.json", execution_date=None):
@@ -113,6 +163,17 @@ def run_silver_pipeline(filename="demandes_togo_raw.json", execution_date=None):
 
     df = df.withColumn("event_date", coalesce(*date_expressions))
 
+    # 5. Parsing du champ géographique (lat,lon)
+    geo_cfg = catalog.get("geo_config", {})
+    if geo_cfg:
+        df = apply_geo_parsing(df, geo_cfg)
+    else:
+        logging.warning(
+            "Aucune section 'geo_config' dans le catalogue. Champs geo ignorés."
+        )
+        df = df.withColumn("latitude", lit(None).cast("double"))
+        df = df.withColumn("longitude", lit(None).cast("double"))
+
     # 5. Nettoyage final
     final_df = df.select(
         col("standard_id").alias("request_id"),
@@ -121,6 +182,8 @@ def run_silver_pipeline(filename="demandes_togo_raw.json", execution_date=None):
         col("standard_commune").alias("commune"),
         col("standard_neighborhood").alias("neighborhood"),
         col("event_date").alias("request_timestamp"),
+        col("latitude"),
+        col("longitude"),
     ).filter(col("request_id").isNotNull())
 
     # 6. Écriture vers MinIO Silver (Format Parquet)
@@ -128,6 +191,32 @@ def run_silver_pipeline(filename="demandes_togo_raw.json", execution_date=None):
     final_df.write.mode("overwrite").parquet(silver_path)
 
     logging.info(f"Pipeline Silver terminé. Données écrites dans {silver_path}")
+    
+    pg_host = os.getenv("POSTGRES_HOST", "postgres")
+    pg_port = os.getenv("POSTGRES_PORT", "5432")
+    pg_db = os.getenv("POSTGRES_DB")
+    
+    pg_url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
+    
+    logging.info(f"Démarrage de l'exportation vers PostgreSQL : {pg_url}")
+
+    try:
+        final_df.write \
+            .format("jdbc") \
+            .option("url", pg_url) \
+            .option("dbtable", os.getenv("SILVER_SCHEMA") + "." + os.getenv("SILVER_TABLE")) \
+            .option("user", os.getenv("POSTGRES_USER")) \
+            .option("password", os.getenv("POSTGRES_PASSWORD")) \
+            .option("driver", "org.postgresql.Driver") \
+            .mode("append") \
+            .save()
+        
+        logging.info(f"✅ Données chargées avec succès dans la table '{os.getenv('SILVER_SCHEMA')}.{os.getenv('SILVER_TABLE')}' !")
+        
+    except Exception as e:
+        logging.error(f"❌ Erreur lors de l'écriture dans PostgreSQL : {e}")
+        raise
+    
     spark.stop()
 
 
