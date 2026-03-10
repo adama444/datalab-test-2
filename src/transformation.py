@@ -1,178 +1,135 @@
+from datetime import datetime
 import json
 import logging
 import os
-from datetime import datetime
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, coalesce, lower, try_to_timestamp, from_unixtime, lit, when
-from dotenv import load_dotenv
-from pyspark.sql.functions import get_json_object
-
-# Setup logging
-LOG_DIR = "logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-logging.basicConfig(
-    filename=f"{LOG_DIR}/pipeline_{datetime.now().strftime('%Y%m%d')}.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+from pyspark.sql.functions import (
+    col,
+    coalesce,
+    lower,
+    try_to_timestamp,
+    from_unixtime,
+    lit,
+    when,
+    split,
+    trim,
 )
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- CONFIGURATION LOGGING ---
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# Récupère le dossier où se trouve le script actuel
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CATALOG_PATH = os.path.join(SCRIPT_DIR, "mapping_catalog.json")
+
+
+def get_spark_session():
+    return (
+        SparkSession.builder.appName("Togo-Public-Services-Silver")
+        .config("spark.sql.legacy.timeParserPolicy", "CORRECTED")
+        .getOrCreate()
+    )  # récupère le contexte déjà configuré par spark-submit
 
 
 def resolve_column(df, field):
-    parts = field.split(".")
-    if len(parts) == 1:
-        return col(field) if field in df.columns else None
-
-    parent, subfield = parts[0], ".".join(parts[1:])
-    parent_type = dict(df.dtypes).get(parent, "")
-
-    if parent_type.startswith("struct"):
-        return col(field)
-    elif parent_type == "string":
-        return get_json_object(col(parent), f"$.{subfield}")
-    else:
-        return None
+    """Gère les champs imbriqués (struct) et les champs plats."""
+    if "." in field:
+        parent = field.split(".")[0]
+        if parent in df.columns:
+            parent_type = dict(df.dtypes).get(parent, "")
+            if parent_type.startswith("struct"):
+                return col(field)
+        return None  # parent est string ou absent → on ignore
+    return col(field) if field in df.columns else None
 
 
-def run_fully_dynamic_silver():
-    load_dotenv()
+def run_silver_pipeline(filename="demandes_togo_raw.json", execution_date=None):
+    current_date = execution_date or datetime.now().strftime("%Y%m%d")
+    spark = get_spark_session()
 
-    endpoint = os.getenv("MINIO_ENDPOINT")
-    access_key = os.getenv("MINIO_ACCESS_KEY")
-    secret_key = os.getenv("MINIO_SECRET_KEY")
-
-    # Configure Spark with S3A (S3 connectivity for Hadoop)
-    spark = (
-        SparkSession.builder.appName("Togo_S3_Bronze_Ingestion")
-        .config("spark.hadoop.fs.s3a.endpoint", endpoint)
-        .config("spark.hadoop.fs.s3a.access.key", access_key)
-        .config("spark.hadoop.fs.s3a.secret.key", secret_key)
-        .config("spark.hadoop.fs.s3a.path.style.access", "true")
-        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        .config(
-            "spark.jars.packages",
-            "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262",
-        )
-        # Override any bad timeout values with plain integers
-        .config(
-            "spark.hadoop.fs.s3a.aws.credentials.provider",
-            "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
-        )
-        # Override all duration configs with plain integers
-        .config("spark.hadoop.fs.s3a.threads.keepalivetime", "60")
-        .config("spark.hadoop.fs.s3a.connection.timeout", "60000")
-        .config("spark.hadoop.fs.s3a.socket.timeout", "60000")
-        .config("spark.hadoop.fs.s3a.connection.establish.timeout", "5000")
-        .config("spark.hadoop.fs.s3a.retry.interval", "500")
-        .config("spark.hadoop.fs.s3a.multipart.purge.age", "86400")
-        .config("spark.hadoop.fs.s3a.retry.throttle.interval", "500")
-        .getOrCreate()
-    )
-
-    with open("/app/config/mapping_catalog.json", "r") as f:
+    # 1. Chargement du catalogue et des données
+    with open(CATALOG_PATH, "r") as f:
         catalog = json.load(f)
 
-    # 2. Read from Bronze Zone
-    bronze_path = "s3a://togo-public-srv/bronze/"
-    logging.info(f"Reading from Bronze: {bronze_path}")
-    df = spark.read.parquet(bronze_path)
+    raw_path = f"s3a://{os.getenv('MINIO_BUCKET_RAW')}/{filename}"
+    df = spark.read.option("multiline", "true").json(raw_path)
+    df.printSchema()
 
-    # --- 1. Dynamic Column Mapping ---
+    # 2. Normalisation des colonnes via le Catalogue
     for target_col, source_fields in catalog["mappings"].items():
-        valid_cols = []
-        for f in source_fields:
-            parent = f.split(".")[0]
-            if parent not in df.columns:
-                continue
-            resolved = resolve_column(df, f)
-            if resolved is not None:
-                valid_cols.append(resolved)
-
-        if valid_cols:
-            df = df.withColumn(target_col, lower(coalesce(*valid_cols)))
+        # On filtre les colonnes qui existent réellement dans le fichier JSON actuel
+        valid_sources = [
+            resolve_column(df, f)
+            for f in source_fields
+            if resolve_column(df, f) is not None
+        ]
+        if valid_sources:
+            df = df.withColumn(target_col, coalesce(*valid_sources))
         else:
-            df = df.withColumn(target_col, lit(None).cast("string"))
+            df = df.withColumn(target_col, lit(None))
 
-    # --- 2. Dynamic Date Normalization ---
+    # 3. Cas particulier : localisation (STRING) (ex: "Agbodrafo - Aného")
+    if "localisation" in df.columns:
+        loc_type = dict(df.dtypes).get("localisation", "")
+
+        if loc_type == "string":
+            df = df.withColumn(
+                "standard_neighborhood",
+                when(
+                    col("standard_neighborhood").isNull()
+                    & col("localisation").contains(" - "),
+                    trim(split(col("localisation"), " - ").getItem(0)),
+                ).otherwise(col("standard_neighborhood")),
+            )
+            df = df.withColumn(
+                "standard_commune",
+                when(
+                    col("standard_commune").isNull()
+                    & col("localisation").contains(" - "),
+                    trim(split(col("localisation"), " - ").getItem(1)),
+                ).otherwise(col("standard_commune")),
+            )
+
+    # 4. Normalisation des dates (Timestamp Unix vs String)
     date_cfg = catalog["date_config"]
     date_expressions = []
-    temp_cols = []  # track temp columns to drop later
 
-    # Filter fields that actually exist in the dataframe
-    for field in date_cfg["source_fields"]:
-        # Check the parent column actually exists
-        parent = field.split(".")[0]
-        if parent not in df.columns:
-            continue
-
-        parent_type = dict(df.dtypes).get(parent, "")
-
-        # Materialize the field into a real temp column first
-        temp_col_name = f"_tmp_{field.replace('.', '_')}"
-        temp_cols.append(temp_col_name)
-
-        if "." not in field:
-            df = df.withColumn(temp_col_name, col(field).cast("string"))
-        elif parent_type.startswith("struct"):
-            df = df.withColumn(temp_col_name, col(field).cast("string"))
-        elif parent_type == "string":
-            df = df.withColumn(
-                temp_col_name,
-                get_json_object(col(parent), f"$.{field.split('.', 1)[1]}"),
+    for f in date_cfg["source_fields"]:
+        c = resolve_column(df, f)
+        if c is not None:
+            date_expressions.append(
+                when(
+                    c.cast("double").isNotNull(),
+                    from_unixtime(c.cast("double")).cast("timestamp"),
+                )
             )
-        else:
-            temp_cols.pop()  # didn't add it
-            continue
+            for fmt in date_cfg["formats"]:
+                date_expressions.append(try_to_timestamp(c.cast("string"), lit(fmt)))
 
-        # A. Try parsing as Unix Timestamp
-        # With this — only cast to double if value is numeric:
-        date_expressions.append(
-            when(
-                col(temp_col_name).rlike(r"^\d+(\.\d+)?([eE]\d+)?$"),
-                from_unixtime(col(temp_col_name).cast("double"))
-            ).otherwise(lit(None).cast("timestamp"))
-        )
-        for fmt in date_cfg["formats"]:
-            date_expressions.append(try_to_timestamp(col(temp_col_name), lit(fmt)))
+    df = df.withColumn("event_date", coalesce(*date_expressions))
 
-    # Guard: only apply coalesce if we have expressions
-    if date_expressions:
-        df = df.withColumn("standard_date", coalesce(*date_expressions))
-    else:
-        logging.warning("No valid date fields found — standard_date will be null.")
-        df = df.withColumn("standard_date", lit(None).cast("timestamp"))
+    # 5. Nettoyage final
+    final_df = df.select(
+        col("standard_id").alias("request_id"),
+        lower(col("standard_service")).alias("category"),
+        lower(col("standard_status")).alias("status"),
+        col("standard_commune").alias("commune"),
+        col("standard_neighborhood").alias("neighborhood"),
+        col("event_date").alias("request_timestamp"),
+    ).filter(col("request_id").isNotNull())
 
-    # Drop all temp columns
-    df = df.drop(*temp_cols)
+    # 6. Écriture vers MinIO Silver (Format Parquet)
+    silver_path = f"s3a://{os.getenv('MINIO_BUCKET_CLEANED')}/cleaned_{filename.split('.')[0]}_{current_date}"
+    final_df.write.mode("overwrite").parquet(silver_path)
 
-    # --- 3. Anomaly Detection & Logging ---
-    # A record is an anomaly if it has no ID or no valid Date after all attempts
-    df_valid = df.filter(
-        col("standard_id").isNotNull() & col("standard_date").isNotNull()
-    )
-    df_anomalies = df.filter(
-        col("standard_id").isNull() | col("standard_date").isNull()
-    )
-
-    anomaly_count = df_anomalies.count()
-    if anomaly_count > 0:
-        logging.warning(f"Detected {anomaly_count} anomalies.")
-        sample = df_anomalies.limit(1).toJSON().first()
-        logging.error(f"SCHEMA MISMATCH EXAMPLE: {sample}")
-
-    # --- 4. Final Save ---
-    final_cols = list(catalog["mappings"].keys()) + ["standard_date"]
-    df_silver = df_valid.select(*final_cols)
-
-    silver_path = "s3a://togo-public-srv/silver/"
-    logging.info(f"Writing to Silver: {silver_path}")
-
-    df_silver.write.mode("overwrite").parquet(silver_path)
-
-    logging.info(
-        f"✅ Silver Transformation Complete. Records processed: {df_silver.count()}"
-    )
+    logging.info(f"Pipeline Silver terminé. Données écrites dans {silver_path}")
     spark.stop()
 
 
 if __name__ == "__main__":
-    run_fully_dynamic_silver()
+    run_silver_pipeline()

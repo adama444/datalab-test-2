@@ -1,0 +1,19 @@
+FROM apache/superset:latest
+
+USER root
+
+RUN pip install \
+    --no-cache-dir \
+    --target /app/.venv/lib/python3.10/site-packages psycopg2-binary
+
+ENV SUPERSET_ADMIN_USERNAME $SUPERSET_ADMIN_USERNAME
+ENV SUPERSET_ADMIN_EMAIL $SUPERSET_ADMIN_EMAIL
+ENV SUPERSET_ADMIN_PASSWORD $SUPERSET_ADMIN_PASSWORD
+
+COPY ./scripts/superset_init.sh /superset-init.sh
+
+COPY ./scripts/superset_config.py /app/
+ENV SUPERSET_CONFIG_PATH /app/superset_config.py
+
+USER superset
+ENTRYPOINT [ "/superset-init.sh" ]

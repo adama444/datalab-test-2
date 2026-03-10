@@ -1,39 +1,49 @@
-import boto3
-from botocore.client import Config
-from botocore.exceptions import ClientError
+import os
+from minio import Minio
+from minio.error import S3Error
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
-def upload_to_s3():
-    bucket_name = "togo-public-srv"
-    file_path = "data/demandes_services_publics_togo.json"
-    object_name = "raw/demandes_services_publics_togo.json"
+def ingest_to_minio(file_path, bucket_name, object_name):
+    endpoint = os.getenv("MINIO_ENDPOINT", "localhost:9002")
+    access_key = os.getenv("MINIO_ROOT_USER")
+    secret_key = os.getenv("MINIO_ROOT_PASSWORD")
+    
+    clean_endpoint = endpoint.replace("http://", "").replace("https://", "").strip("/")
 
-    s3_client = boto3.client(
-        "s3",
-        endpoint_url="http://localhost:9000",
-        aws_access_key_id="admin",
-        aws_secret_access_key="password123",
-        config=Config(signature_version="s3v4"),
-        region_name="us-east-1",
+    client = Minio(
+        clean_endpoint,
+        access_key=access_key,
+        secret_key=secret_key,
+        secure=False,
     )
 
     try:
-        s3_client.head_bucket(Bucket=bucket_name)
-        print(f"Bucket '{bucket_name}' verified.")
-    except ClientError as e:
-        error_code = e.response["Error"]["Code"]
-        if error_code == "404":
-            print(f"Bucket '{bucket_name}' not found. Creating...")
-            s3_client.create_bucket(Bucket=bucket_name)
-        else:
-            raise e
+        # 1. Vérification/Création du bucket
+        if not client.bucket_exists(bucket_name):
+            client.make_bucket(bucket_name)
+            print(f"✅ Bucket '{bucket_name}' créé.")
 
-    try:
-        s3_client.upload_file(file_path, bucket_name, object_name)
-        print(f"✅ Successfully uploaded to MinIO: {bucket_name}/{object_name}")
+        if not os.path.exists(file_path):
+            print(f"❌ Erreur : Le fichier {file_path} est introuvable.")
+            return
+
+        client.fput_object(
+            bucket_name, object_name, file_path, content_type="application/json"
+        )
+        print(f"🚀 Succès : '{file_path}' -> '{bucket_name}/{object_name}'")
+
+    except S3Error as exc:
+        print(f"❌ Erreur S3 : {exc}")
     except Exception as e:
-        print(f"❌ Upload failed: {e}")
+        print(f"❌ Erreur inattendue : {e}")
 
 
 if __name__ == "__main__":
-    upload_to_s3()
+    ingest_to_minio(
+        file_path="data/demandes_services_publics.json",
+        bucket_name=os.getenv("MINIO_BUCKET_RAW", "raw"),
+        object_name="demandes_togo_raw.json",
+    )
